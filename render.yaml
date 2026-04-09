@@ -1,14 +1,18 @@
 services:
   - type: web
-    name: pest-shield-api
+    name: cassava-guard-api
     env: python
     plan: free
-    rootDir: pest_shield_app
+    # Repository root = parent of `cassava/` (Cassava Guard monorepo). If the repo is only this app folder, remove rootDir in the Render dashboard or set to empty.
+    rootDir: cassava
     buildCommand: pip install -r requirements_api.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     autoDeploy: true
+    healthCheckPath: /health
     envVars:
       - key: OPENROUTER_API_KEY
         sync: false
+      - key: CASSAVA_VISION_MODEL
+        value: openai/gpt-4o-mini
       - key: PEST_VISION_MODEL
         value: openai/gpt-4o-mini
