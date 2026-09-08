@@ -1,0 +1,25 @@
+# Training checkpoints — 104 MB, over GitHub's 100 MB per-file limit.
+# Only needed to regenerate the ONNX graph via export_onnx.py.
+*.pth
+*.pth.part
+
+# fp32 ONNX intermediate (104 MB). The int8 graph is what ships.
+cassava_customcnn.onnx
+cassava_customcnn.onnx.data
+*.onnx.part
+_merged.onnx
+sym_shape_infer_temp.onnx
+
+.env
+__pycache__/
+*.pyc
+server.log
+test_leaf.jpg
+
+# Flutter app lives in its own repo: github.com/KelpyShades/cassava_guard
+cassava_guard/
+cassava_guard.zip
+
+# Training notebook + stray ONNX external-data blobs
+nn-final-project*.ipynb
+*.data

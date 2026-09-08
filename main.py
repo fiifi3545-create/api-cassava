@@ -1,88 +1,51 @@
 """
-Cassava Guard — vision API (OpenRouter-compatible) for cassava leaf images.
-POST /analyze-cassava with an image; returns disease class, analysis, suggestions.
+Cassava Guard — vision API backed by the CustomCNN trained in
+`nn-final-project (3).ipynb` (checkpoint: best_CustomCNN.pth).
 
-Dataset folder names (training labels) are listed in CASSAVA_DATASET_CLASSES.
-The model may also return other outcomes when the leaf does not fit those classes.
+POST /analyze-cassava with an image; returns disease class, confidence,
+analysis and suggestions.
 
 Run:
   pip install -r requirements_api.txt
   uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
-.env:
-  OPENROUTER_API_KEY=sk-or-...
-  # optional: CASSAVA_VISION_MODEL=openai/gpt-4o-mini
+Env (.env):
+  CASSAVA_MODEL_PATH=./best_CustomCNN.pth   # checkpoint location
+  CASSAVA_MIN_CONFIDENCE=0.40               # below this -> "Unclear / not a cassava leaf"
 """
 
 from __future__ import annotations
 
-import base64
 import os
-import re
-from dataclasses import dataclass
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
 from pydantic import BaseModel, Field
+
+from advice import analysis_for, suggestions_for
+from model import (
+    CASSAVA_DATASET_CLASSES,
+    UNCLEAR_LABEL,
+    ModelNotAvailable,
+    load_model,
+    model_info,
+    predict,
+)
 
 load_dotenv()
 
-MODEL = os.getenv("CASSAVA_VISION_MODEL") or os.getenv("PEST_VISION_MODEL", "openai/gpt-4o-mini")
-OPENROUTER_BASE = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+MODEL_PATH = os.getenv("CASSAVA_MODEL_PATH")
+MODEL_NAME = "CustomCNN (ONNX)"
 
+# The network only knows five classes, so it will still answer confidently on a
+# photo of something else. A softmax floor is a crude but useful guard.
+try:
+    MIN_CONFIDENCE = float(os.getenv("CASSAVA_MIN_CONFIDENCE", "0.40"))
+except ValueError:
+    MIN_CONFIDENCE = 0.40
 
-@dataclass(frozen=True)
-class CassavaClassInfo:
-    """One class as stored on disk (folder name) and human-readable label."""
-
-    folder_name: str
-    label: str
-
-
-# Order matches common PlantVillage-style cassava naming; folder_name must match your dataset dirs.
-CASSAVA_DATASET_CLASSES: tuple[CassavaClassInfo, ...] = (
-    CassavaClassInfo("cassava _mosaic_disease", "Cassava mosaic disease"),
-    CassavaClassInfo("Cassava___bacterial_blight", "Cassava bacterial blight"),
-    CassavaClassInfo("Cassava___brown_streak_disease", "Cassava brown streak disease"),
-    CassavaClassInfo("Cassava___green_mottle", "Cassava green mottle"),
-    CassavaClassInfo("Cassava___healthy", "Healthy"),
-)
-
-# Section 1 lines the LLM is allowed to use (canonical outputs).
-_CANONICAL_LABELS: tuple[str, ...] = tuple(c.label for c in CASSAVA_DATASET_CLASSES) + (
-    "Other cassava problem (specify briefly)",
-    "Unclear / not a cassava leaf",
-)
-
-
-def _class_prompt_block() -> str:
-    lines = "\n".join(f"- {lab}" for lab in _CANONICAL_LABELS)
-    folders = "\n".join(
-        f"- {c.folder_name} → report as “{c.label}”" for c in CASSAVA_DATASET_CLASSES
-    )
-    return f"""Training/dataset classes (folder names on disk → label to use in Section 1):
-{folders}
-
-Section 1 must be EXACTLY one of these lines (copy spelling):
-{lines}
-
-If the leaf shows a different cassava disorder not in the list, use “Other cassava problem (specify briefly)” and name it in Section 2.
-If the image is not a cassava leaf, too blurry, or unrelated, use “Unclear / not a cassava leaf”."""
-
-
-def _get_client() -> OpenAI:
-    key = os.getenv("OPENROUTER_API_KEY") or os.getenv("CHRISKEY")
-    if not key:
-        raise HTTPException(
-            status_code=503,
-            detail="Set OPENROUTER_API_KEY (or CHRISKEY) in .env.",
-        )
-    return OpenAI(base_url=OPENROUTER_BASE, api_key=key)
-
-
-app = FastAPI(title="Cassava Guard API", version="1.0.0")
+app = FastAPI(title="Cassava Guard API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -93,137 +56,78 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+def _warm_model() -> None:
+    """Load weights at boot so the first scan is not the slow one."""
+    try:
+        load_model(MODEL_PATH)
+    except ModelNotAvailable as e:
+        # Don't crash the process — /health reports the problem instead.
+        print(f"[cassava_guard] WARNING: {e}")
+
+
 class CassavaAnalysisResponse(BaseModel):
-    disease_class: str = Field(..., description="Canonical class or other/unclear outcome")
-    analysis: str = Field(..., description="What is visible; uncertainty")
+    disease_class: str = Field(..., description="Predicted class, or Unclear below threshold")
+    analysis: str = Field(..., description="What the prediction means; includes confidence")
     suggestions: str = Field(..., description="Farmer-facing management advice")
-    pest: str = Field(
-        ...,
-        description="Deprecated alias for disease_class (same value)",
-    )
+    confidence: float = Field(..., description="Softmax probability of the predicted class, 0-1")
+    probabilities: dict[str, float] = Field(..., description="Probability per class")
+    pest: str = Field(..., description="Deprecated alias for disease_class (same value)")
 
 
-def _encode_image(data: bytes) -> str:
-    return base64.b64encode(data).decode("utf-8")
+@app.get("/")
+def index():
+    """Root: what this service is and where to go."""
+    return {
+        "app": "cassava_guard",
+        "model": MODEL_NAME,
+        "docs": "/docs",
+        "endpoints": {
+            "POST /analyze-cassava": "multipart form field 'file' = leaf image",
+            "POST /analyze-pest": "legacy alias of /analyze-cassava",
+            "GET /health": "service and model status",
+            "GET /classes": "the five classes the model predicts",
+        },
+    }
 
 
-def _analyze_cassava_leaf_image(image_base64: str) -> str:
-    system = f"""You are an agricultural extension assistant for smallholder farmers in Ghana and similar climates.
-The user sends a photo that should be a cassava (Manihot esculenta) leaf for disease/health assessment.
-
-{_class_prompt_block()}
-
-Respond in exactly three sections separated by the line ---SECTION---
-Section 1: exactly one of the allowed lines above (single line).
-Section 2 (2–5 sentences): visible signs; note uncertainty; if “Other”, name the suspected issue.
-Section 3: practical suggestions — cultural/mechanical first; involve extension when needed; avoid specific pesticide brands unless essential.
-
-Crops only — not human medical advice."""
-
-    user_text = (
-        "Classify this cassava leaf image using the allowed Section 1 labels. "
-        "Prefer the dataset class names when symptoms fit; otherwise use Other or Unclear as defined."
-    )
-
-    cli = _get_client()
-    rsp = cli.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
-                    },
-                ],
-            },
-        ],
-        temperature=0.2,
-        max_tokens=900,
-    )
-    return rsp.choices[0].message.content or ""
-
-
-def _split_sections(raw: str) -> tuple[str, str, str]:
-    parts = re.split(r"\s*---SECTION---\s*", raw.strip(), maxsplit=2)
-    if len(parts) >= 3:
-        return parts[0].strip(), parts[1].strip(), parts[2].strip()
-    paragraphs = [p.strip() for p in raw.split("\n\n") if p.strip()]
-    if len(paragraphs) >= 3:
-        return paragraphs[0], paragraphs[1], paragraphs[2]
-    if len(paragraphs) == 2:
-        return paragraphs[0], paragraphs[1], "Consult your agriculture extension agent for confirmation."
-    if len(paragraphs) == 1:
-        return "Unclear / not a cassava leaf", paragraphs[0], "Verify in the field with extension support."
-    return "Unclear / not a cassava leaf", raw.strip() or "No content", "Retake a closer, well-lit photo of the leaf."
-
-
-def _snap_disease_line(line: str) -> str:
-    """Map close matches to canonical labels; otherwise return stripped line."""
-    s = line.strip()
-    if s in _CANONICAL_LABELS:
-        return s
-    low = s.lower()
-    for lab in _CANONICAL_LABELS:
-        if lab.lower() == low:
-            return lab
-    for c in CASSAVA_DATASET_CLASSES:
-        if c.folder_name.lower() in low or c.label.lower() in low:
-            return c.label
-    return s
-
-
-def _normalize_unclear(
-    disease_class: str, analysis: str, suggestions: str
-) -> tuple[str, str, str]:
-    text = f"{disease_class} {analysis}".lower()
-    unclear_markers = [
-        "unclear",
-        "not a cassava",
-        "non-crop",
-        "cannot identify",
-        "insufficient detail",
-        "blurry",
-        "out of focus",
-        "not cassava",
-    ]
-    if any(marker in text for marker in unclear_markers):
-        return (
-            "Unclear / not a cassava leaf",
-            analysis,
-            "Retake the photo: single cassava leaf, fill the frame, in good daylight. "
-            "If symptoms persist, consult a local extension officer.",
-        )
-    return disease_class, analysis, suggestions
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": MODEL, "app": "cassava_guard"}
+    try:
+        load_model(MODEL_PATH)
+        model_state = "loaded"
+    except ModelNotAvailable as e:
+        model_state = f"unavailable: {e}"
+    return {
+        "status": "ok",
+        "app": "cassava_guard",
+        "model": MODEL_NAME,
+        "model_state": model_state,
+        "model_file": model_info(MODEL_PATH),
+        "min_confidence": MIN_CONFIDENCE,
+    }
 
 
 @app.get("/classes")
 def list_classes():
-    """Dataset folder names and display labels (for app / training alignment)."""
+    """Training labels and display labels (for app / training alignment)."""
     return {
+        "model": MODEL_NAME,
         "dataset_classes": [
-            {"folder_name": c.folder_name, "label": c.label} for c in CASSAVA_DATASET_CLASSES
+            {"index": c.index, "folder_name": c.folder_name, "label": c.label}
+            for c in CASSAVA_DATASET_CLASSES
         ],
-        "section1_options": list(_CANONICAL_LABELS),
-        "note": "API may return Other/Unclear when the image does not match the five dataset classes.",
+        "extra_outcomes": [UNCLEAR_LABEL],
+        "note": (
+            f"Predictions below {MIN_CONFIDENCE:.2f} softmax confidence are reported as "
+            f"'{UNCLEAR_LABEL}'."
+        ),
     }
-
-
-def _analysis_result(disease: str, analysis: str, suggestions: str) -> CassavaAnalysisResponse:
-    return CassavaAnalysisResponse(
-        disease_class=disease,
-        pest=disease,
-        analysis=analysis,
-        suggestions=suggestions,
-    )
 
 
 @app.post("/analyze-cassava", response_model=CassavaAnalysisResponse)
@@ -236,16 +140,27 @@ async def analyze_cassava(file: UploadFile = File(...)):
         raise HTTPException(status_code=413, detail="Image too large (max 15 MB).")
 
     try:
-        full = _analyze_cassava_leaf_image(_encode_image(image_data))
-        disease, analysis, suggestions = _split_sections(full)
-        disease = _snap_disease_line(disease)
-        disease, analysis, suggestions = _normalize_unclear(disease, analysis, suggestions)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Vision model error: {e!s}") from e
+        result = predict(image_data, MODEL_PATH)
+    except ModelNotAvailable as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Inference error: {e!s}") from e
 
-    return _analysis_result(disease, analysis, suggestions)
+    label = result["label"]
+    confidence = result["confidence"]
+    if confidence < MIN_CONFIDENCE:
+        label = UNCLEAR_LABEL
+
+    return CassavaAnalysisResponse(
+        disease_class=label,
+        pest=label,
+        analysis=analysis_for(label, confidence),
+        suggestions=suggestions_for(label),
+        confidence=round(confidence, 4),
+        probabilities=result["probabilities"],
+    )
 
 
 @app.post("/analyze-pest", response_model=CassavaAnalysisResponse)
